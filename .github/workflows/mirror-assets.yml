@@ -1,0 +1,34 @@
+name: Mirror release assets (one-shot)
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Download assets from private release
+        env:
+          GH_TOKEN: ${{ secrets.IMPORT_TOKEN }}
+        run: |
+          set -e
+          mkdir -p dist
+          gh release download air-alternate-15 \
+            -R lindedaoqwq/Minecraft-Air-Alternate -D dist
+          ls -lh dist
+          test -f dist/Air-Alternate-6.0.0-ios.ipa
+          test -f dist/Air-Alternate-6.0.0-ios-trollstore.tipa
+      - name: Publish to public fork release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          gh release create air-alternate-15 dist/* \
+            -R lindedaoqwq/Amethyst-iOS-MyRemastered \
+            --title "Air Alternate 6.0.0 (fix15 build)" \
+            --notes "Mirrored from the private source repo. IPA + TrollStore TIPA, 240.51 MB each. Built by run #15 (macos-15). fix16 is comment/dead-code cleanup only, so runtime behaviour is identical to this binary." \
+            || gh release upload air-alternate-15 dist/* --clobber \
+                 -R lindedaoqwq/Amethyst-iOS-MyRemastered
+          gh release view air-alternate-15 -R lindedaoqwq/Amethyst-iOS-MyRemastered \
+            --json assets --jq '.assets[] | [.name, .size, .url] | @tsv'
