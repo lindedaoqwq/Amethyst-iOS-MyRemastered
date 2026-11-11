@@ -1,9 +1,0 @@
-name: Runner probe (diagnostic)
-on:
-  workflow_dispatch:
-jobs:
-  probe:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Echo probe
-        run: echo "hosted runner allocated ok"
