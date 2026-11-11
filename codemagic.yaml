@@ -1,0 +1,180 @@
+# Air Alternate 6.0.0 —— 不用自有 Mac、不用 GitHub Actions 的构建配置
+#
+# 平台：Codemagic 免费层（Mac mini M2，500 macOS 分钟/月，无需信用卡）
+# 仓库：public fork lindedaoqwq/Amethyst-iOS-MyRemastered（源码自包含，无需私有凭据）
+#
+# 用法（仅需一次）：
+#   1. 用 GitHub 账号登录 https://codemagic.io/start
+#   2. Add application -> 选上面这个 public 仓库 -> 选 "Workflow Editor / codemagic.yaml"
+#   3. Start new build -> 选本 workflow -> 构建结束后在 Artifacts 下载 .ipa / .tipa
+#
+# 说明：完整移植 .github/workflows/build.yml 的构建链，去掉了 GitHub Actions 专有的
+# uses: / GITHUB_ENV / ::error:: / upload-artifact / gh release，改为 Codemagic 的
+# scripts + artifacts。Xcode 选择改为自动探测（不硬编码 /Applications/Xcode_15.4.app，
+# 该路径在 Codemagic 镜像上不存在）。fix13/14/15/16 源码状态断言保留。
+
+workflows:
+  air-alternate-ios:
+    name: Air Alternate 6.0.0 (IPA + TIPA)
+    # 必须显式声明：Codemagic 默认机型是 linux_x2，不写就跑不到 macOS。
+    # mac_mini_m2 属于免费层可用机型；mac_mini_m4 需开通计费，不要用。
+    instance_type: mac_mini_m2
+    # 免费层单次构建硬上限 120 分钟（GitHub workflow 原本给的是 300 分钟，
+    # 这是本方案唯一的时长风险，见下方说明）。
+    max_build_duration: 120
+    # 不写 triggering = 只能手动 Start new build，不会因 push 自动烧分钟数。
+    environment:
+      xcode: latest
+      vars:
+        GIT_LFS_SKIP_SMUDGE: "1"
+        IPHONEOS_DEPLOYMENT_TARGET: "14.0"
+        HOMEBREW_NO_AUTO_UPDATE: "1"
+        HOMEBREW_NO_INSTALL_CLEANUP: "1"
+        SLIMMED: "0"
+        RUNNER: "1"
+    scripts:
+      - name: Verify source state
+        script: |
+          set -e
+          cd "$CM_BUILD_DIR"
+          test -f Makefile
+          test -f Natives/Info.plist
+          test -f Natives/resources/Frameworks/libMoltenVK.dylib
+          echo "== bundle identity =="
+          echo "CFBundleIdentifier = $(plutil -extract CFBundleIdentifier raw Natives/Info.plist)"
+          echo "CFBundleDisplayName = $(plutil -extract CFBundleDisplayName raw Natives/Info.plist)"
+          test "$(plutil -extract CFBundleIdentifier raw Natives/Info.plist)" = "com.airalternate.amethyst"
+          test "$(plutil -extract CFBundleDisplayName raw Natives/Info.plist)" = "Air Alternate"
+          python3 - <<'PY'
+          import pathlib, re
+          p = pathlib.Path
+          d = p('Natives/resources/Frameworks/libMoltenVK.dylib').read_bytes()
+          assert len(d) > 1000000 and d[:4] == b'\xcf\xfa\xed\xfe', 'libMoltenVK.dylib is not Mach-O'
+          assert b'1.4.2' in d and b'1.2.9' not in d, 'MoltenVK is not iOS 1.4.2'
+          mk = p('Makefile').read_text()
+          assert 'weaken_libcxx_imports.py --all' in mk, 'full-tree weak-import pass missing'
+          assert 'weaken_libcxx_imports.py --verify --all' in mk, 'full-tree verify missing'
+          dn = p('Natives/external/SimpleFPEWrapper/SimpleFPEWrapper/fpe/draw_now.cpp').read_text()
+          assert 'ameFpeVboIndexedDrawSafe' in dn, 'fix13 VBO draw preflight missing'
+          assert 'SYMBOL-SPLIT' in dn, 'fix13 symbol-split diagnostic missing'
+          assert 'NULL-ATTR' in dn and 'ameFpeNullPointerClientAttrib' in dn, 'fix14 NULL client pointer guard missing'
+          jl = p('Natives/JavaLauncher.m').read_text()
+          assert '[fix15][GL4ES-RTLD-GLOBAL]' in jl, 'fix15 rationale missing'
+          assert 'isGL4ESFamilyRenderer(preloadName)' in jl, 'fix15 gl4es-family whitelist missing'
+          assert 'keeps RTLD_GLOBAL' in jl, 'fix15 skip diagnostic missing'
+          vb = p('Natives/ctxbridges/vk_bridge.m').read_text()
+          assert '[fix16][DEAD-CODE]' in vb, 'fix16 vk_bridge annotation missing'
+          eb = p('Natives/egl_bridge.m').read_text()
+          assert 'set_vk_bridge_tbl();' not in eb, 'fix16: vk_bridge must stay unwired'
+          gbh = re.sub(r'//[^\n]*', '', p('Natives/ctxbridges/gl4es_family_boot.h').read_text())
+          assert 'ame_gap_renderer_selected' not in gbh, 'fix16 dead declaration still present'
+          gbm = re.sub(r'//[^\n]*', '', p('Natives/ctxbridges/gl4es_family_boot.m').read_text())
+          assert 'ame_gap_renderer_selected' not in gbm, 'fix16 dead definition still present'
+          assert 'RENDERER_GAP_EXTRAS ?= 0' in mk, 'fix16 gap extras must stay opt-in'
+          assert '[fix16] 当前 main 状态' in p('RENDERER_GAP_PROVENANCE.md').read_text(), 'fix16 provenance note missing'
+          print('source state: VERIFIED (fix13 + fix14 + fix15 + fix16)')
+          PY
+
+      - name: Select Xcode and resolve iOS SDK
+        script: |
+          set -e
+          cd "$CM_BUILD_DIR"
+          ls -d /Applications/Xcode*.app 2>/dev/null || true
+          xcodebuild -version || true
+          PICK=""
+          for app in $(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V -r); do PICK="$app"; break; done
+          if [ -z "$PICK" ]; then
+            for app in $(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V -r); do
+              v=$(basename "$app" | sed -E 's/Xcode_?([0-9]+).*/\1/')
+              if [ -n "$v" ] && [ "$v" -ge 26 ] 2>/dev/null; then PICK="$app"; break; fi
+            done
+          fi
+          if [ -n "$PICK" ]; then sudo xcode-select -s "$PICK/Contents/Developer"; fi
+          echo "DEVELOPER_DIR = $(xcode-select -p)"
+          echo "SDKPATH = $(xcrun --sdk iphoneos --show-sdk-path)"
+
+      - name: Install toolchain (GNU make / ldid / Java 8)
+        script: |
+          cd "$CM_BUILD_DIR"
+          export PATH=/opt/homebrew/bin:$PATH
+          brew install make ldid || echo "brew toolchain step skipped"
+          brew install --cask temurin@8 || echo "temurin@8 cask skipped (not a hard dependency)"
+          gmake --version | head -1
+          command -v ldid || true
+
+      - name: Seed JRE runtimes from released IPA
+        script: |
+          set -e
+          cd "$CM_BUILD_DIR"
+          mkdir -p .deps
+          if [ ! -f .deps/Air-5.1.0.ipa ]; then
+            curl -fsSL --retry 3 -m 900 -o .deps/Air-5.1.0.ipa \
+              "https://github.com/herbrine8403/Amethyst-iOS-MyRemastered/releases/download/5.1.0/Air-5.1.0.ipa"
+          fi
+          ls -lh .deps/Air-5.1.0.ipa
+          rm -rf .deps/ipa_extract && mkdir -p .deps/ipa_extract
+          unzip -q .deps/Air-5.1.0.ipa \
+            'Payload/AngelAuraAmethyst.app/java_runtimes/*' \
+            'Payload/AngelAuraAmethyst.app/Frameworks/libawt_xawt.dylib' \
+            -d .deps/ipa_extract
+          SRC=.deps/ipa_extract/Payload/AngelAuraAmethyst.app
+          mkdir -p depends Natives/build
+          for v in 8 17 21 25; do
+            test -f "$SRC/java_runtimes/java-$v-openjdk/release" || { echo "JRE $v release missing"; exit 1; }
+            test -f "$SRC/java_runtimes/java-$v-openjdk/lib/server/libjvm.dylib" || { echo "JRE $v libjvm.dylib missing"; exit 1; }
+            rm -rf "depends/java-$v-openjdk"
+            cp -R "$SRC/java_runtimes/java-$v-openjdk" depends/
+          done
+          cp "$SRC/Frameworks/libawt_xawt.dylib" Natives/build/libawt_xawt.dylib
+          echo "== seeded JREs =="
+          du -sh depends/java-*-openjdk
+
+      - name: Build regular IPA
+        script: |
+          set -o pipefail
+          cd "$CM_BUILD_DIR"
+          export PATH=/opt/homebrew/bin:$PATH
+          export SLIMMED=0
+          export BUILD_MOBILEGL=1
+          export RUNNER=1
+          export SDKPATH="$(xcrun --sdk iphoneos --show-sdk-path)"
+          export DEVELOPER_DIR="$(xcode-select -p)"
+          mkdir -p ci-logs
+          gmake -j$(sysctl -n hw.ncpu) dsym package PLATFORM=2 2>&1 | tee ci-logs/ios-build.log
+
+      - name: Build TrollStore tipa
+        script: |
+          set -o pipefail
+          cd "$CM_BUILD_DIR"
+          export PATH=/opt/homebrew/bin:$PATH
+          export SLIMMED=0
+          export BUILD_MOBILEGL=0
+          export RUNNER=1
+          export SDKPATH="$(xcrun --sdk iphoneos --show-sdk-path)"
+          export DEVELOPER_DIR="$(xcode-select -p)"
+          gmake -j$(sysctl -n hw.ncpu) dsym package PLATFORM=2 TROLLSTORE_JIT_ENT=1 2>&1 | tee ci-logs/ios-build-trollstore.log
+
+      - name: Collect and rename outputs
+        script: |
+          set -e
+          cd "$CM_BUILD_DIR"
+          mkdir -p dist
+          echo "== artifacts dir =="
+          ls -lh artifacts/ || true
+          IPA=$(find artifacts -maxdepth 1 -type f -name '*.ipa' ! -name '*trollstore*' | head -1)
+          TIPA=$(find artifacts -maxdepth 1 -type f -name '*trollstore*.tipa' | head -1)
+          [ -n "$IPA" ] || { echo "no ipa produced"; exit 1; }
+          cp "$IPA" dist/Air-Alternate-6.0.0-ios.ipa
+          [ -n "$TIPA" ] && cp "$TIPA" dist/Air-Alternate-6.0.0-ios-trollstore.tipa || true
+          ls -lh dist/
+          echo "== bundle id inside IPA =="
+          rm -rf /tmp/ipa_check && mkdir -p /tmp/ipa_check
+          unzip -o -q dist/Air-Alternate-6.0.0-ios.ipa 'Payload/AngelAuraAmethyst.app/Info.plist' -d /tmp/ipa_check
+          PLIST=/tmp/ipa_check/Payload/AngelAuraAmethyst.app/Info.plist
+          echo "CFBundleIdentifier = $(plutil -extract CFBundleIdentifier raw "$PLIST")"
+          test "$(plutil -extract CFBundleIdentifier raw "$PLIST")" = "com.airalternate.amethyst" || { echo "bundle id mismatch"; exit 1; }
+
+    artifacts:
+      - dist/*.ipa
+      - dist/*.tipa
+      - ci-logs/*.log
