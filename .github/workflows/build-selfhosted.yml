@@ -1,0 +1,273 @@
+# [fix16] 零托管额度构建通道 —— 在你自己的 Mac 上跑。
+#
+# GitHub 只对 GitHub-hosted runner 按分钟计费；self-hosted runner 完全免费。
+# 本 workflow 仅响应手动 workflow_dispatch，不响应推送，因此代码上传本身
+# 不会产生任何付费 job。
+#
+# 使用步骤（详见交付目录的 setup-mac-runner.sh / preflight-mac.sh）：
+#   1) 在 Mac 上注册一个带 air-alternate label 的 self-hosted runner 并启动
+#   2) 触发本 workflow：gh workflow run build-selfhosted.yml --ref main
+#      （或在本仓库 Actions 页面手动 Run workflow）
+#   3) 构建完成后从 Actions 的 Artifacts 下载 IPA / TIPA
+#
+# 与 build.yml 的差异（针对自有 Mac 的必要适配）：
+#   - 不执行 sudo xcode-select（需要交互密码，且会改用户全局 Xcode 配置）
+#   - 不执行 brew uninstall openssl@1.1 等破坏性操作（会删用户已装软件）
+#   - 不执行 brew install --cask temurin@8（需要 sudo / 图形授权）
+#   - PATH 同时兼容 Apple Silicon(/opt/homebrew) 与 Intel(/usr/local)
+#   - 启动前集中预检 Xcode / iPhoneOS SDK / JDK 8 / gmake / ldid / cmake
+name: Build Air Alternate (self-hosted Mac)
+
+on:
+  workflow_dispatch:
+    inputs:
+      skip_release:
+        description: '跳过创建 GitHub Release（只上传 Artifacts）'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: air-alternate-selfhosted
+  cancel-in-progress: true
+
+env:
+  GIT_LFS_SKIP_SMUDGE: 1
+
+jobs:
+  build:
+    name: Build Air Alternate IPA/TIPA (self-hosted Mac, 0 hosted minutes)
+    runs-on: [self-hosted, air-alternate]
+    timeout-minutes: 300
+    steps:
+      - name: Checkout source (self-contained, no upstream clone)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          lfs: false
+
+      - name: Preflight local toolchain (self-hosted Mac)
+        run: |
+          set -e
+          echo "== runner =="; uname -m; sw_vers
+          for p in /opt/homebrew/bin /usr/local/bin; do
+            [ -d "$p" ] && export PATH="$p:$PATH"
+          done
+          echo "PATH=$PATH" >> "$GITHUB_ENV"
+          xcodebuild -version || { echo "::error::Xcode 未安装或未选中，请先在 Mac 上执行 sudo xcode-select -s /Applications/Xcode.app/Contents/Developer"; exit 1; }
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          test -n "$SDK" && test -d "$SDK" || { echo "::error::未找到 iPhoneOS SDK，请安装 Xcode 及其 iOS 组件"; exit 1; }
+          echo "SDKPATH=$SDK" >> "$GITHUB_ENV"
+          echo "DEVELOPER_DIR=$(xcode-select -p)" >> "$GITHUB_ENV"
+          command -v gmake >/dev/null || { echo "::error::缺少 GNU make：brew install make"; exit 1; }
+          command -v ldid  >/dev/null || { echo "::error::缺少 ldid：brew install ldid"; exit 1; }
+          command -v cmake >/dev/null || { echo "::error::缺少 cmake：brew install cmake"; exit 1; }
+          command -v git   >/dev/null || { echo "::error::缺少 git"; exit 1; }
+          command -v curl  >/dev/null || { echo "::error::缺少 curl"; exit 1; }
+          command -v unzip >/dev/null || { echo "::error::缺少 unzip"; exit 1; }
+          command -v python3 >/dev/null || { echo "::error::缺少 python3"; exit 1; }
+          JH=$(/usr/libexec/java_home -v 1.8 2>/dev/null || true)
+          test -n "$JH" || { echo "::error::缺少 JDK 8（Makefile BOOTJDK 需要 1.8）：brew install --cask temurin@8"; exit 1; }
+          test -x "$JH/bin/javac" || { echo "::error::JDK 8 无 javac：$JH"; exit 1; }
+          echo "== preflight OK =="
+          echo "  Xcode    : $(xcodebuild -version | head -1)"
+          echo "  SDK      : $SDK"
+          echo "  JDK8     : $JH"
+          echo "  gmake    : $(gmake --version | head -1)"
+          df -h . | tail -1
+
+      - name: Verify source state
+        run: |
+          set -e
+          test -f Makefile
+          test -f Natives/Info.plist
+          test -f Natives/resources/Frameworks/libMoltenVK.dylib
+          echo "== bundle identity (baked into source, no build-time rebrand) =="
+          echo "CFBundleIdentifier = $(plutil -extract CFBundleIdentifier raw Natives/Info.plist)"
+          echo "CFBundleDisplayName = $(plutil -extract CFBundleDisplayName raw Natives/Info.plist)"
+          test "$(plutil -extract CFBundleIdentifier raw Natives/Info.plist)" = "com.airalternate.amethyst"
+          test "$(plutil -extract CFBundleDisplayName raw Natives/Info.plist)" = "Air Alternate"
+          test -f Natives/external/ZeroTierFramework/ios-example-app/zt.framework/zt || {
+            echo "::error::vendored ZeroTier framework missing"; exit 1; }
+          python3 - <<'PY'
+          import pathlib
+          d = pathlib.Path('Natives/resources/Frameworks/libMoltenVK.dylib').read_bytes()
+          assert len(d) > 1000000 and d[:4] == b'\xcf\xfa\xed\xfe', 'libMoltenVK.dylib is not Mach-O'
+          assert b'1.4.2' in d and b'1.2.9' not in d, 'MoltenVK is not iOS 1.4.2'
+          assert '@"key": @ RENDERER_NAME_MITHRIL' in pathlib.Path('Natives/LauncherPreferences.m').read_text(), 'Mithril option missing'
+          assert 'int auto_bind_uniforms;' in pathlib.Path('Natives/shaderc_sandbox.h').read_text(), 'Task 55 fix missing'
+          assert 'AMEFetchVersionManifest' in pathlib.Path('Natives/DownloadViewController.m').read_text(), 'version download fix missing'
+          assert 'AME_MOBILEGL_IOS_COMPAT_VERSION' in pathlib.Path('Natives/external/MobileGL/MobileGL/MG_Compat/iOSLowVersionCompat.c').read_text(), 'MobileGL iOS compat layer missing'
+          assert 'iOSLowVersionCompat.c' in pathlib.Path('Natives/external/MobileGL/CMakeLists.txt').read_text(), 'compat layer not wired into CMake'
+          assert '@"mobilegl_ios_compat": @YES' in pathlib.Path('Natives/PLPreferences.m').read_text(), 'compat toggle default missing'
+          assert 'AME_MOBILEGL_IOS_COMPAT' in pathlib.Path('Natives/JavaLauncher.m').read_text(), 'compat toggle env not injected'
+          w = pathlib.Path('scripts/weaken_libcxx_imports.py').read_text()
+          assert 'LC_DYLD_CHAINED_FIXUPS' in w, 'script is not chained-fixups aware (v1 only patched LC_SYMTAB, dyld ignored it)'
+          assert 'IMPORT_FORMATS' in w and 'weak_shift' in w, 'fixup import table weak-bit rewrite missing'
+          assert 'def self_test' in w, 'script self-test missing'
+          mk = pathlib.Path('Makefile').read_text()
+          assert 'weaken_libcxx_imports.py --all' in mk, 'full-tree weak-import pass not wired into payload'
+          assert 'weaken_libcxx_imports.py --verify --all' in mk, 'full-tree verify not wired into payload'
+          eb = pathlib.Path('Natives/egl_bridge.m').read_text()
+          assert 'refusing to call br_init_context through uninitialised bridge' in eb, 'init failure short-circuit missing'
+          assert 'OpenGL init did not complete' in eb, 'pojavMakeCurrent short-circuit missing'
+          gb = pathlib.Path('Natives/ctxbridges/gl_bridge.m').read_text()
+          assert 'AME_BACKEND_EGL' in gb, 'SFPEW split-mode infra resolution missing'
+          assert 'AME_SFPEW_EGL(eglSwapBuffers' in gb, 'SFPEW lifecycle wrapper routing lost (pending-batch drain)'
+          assert 'AMETHYST_SFPEW_EGL_MODE' in gb, 'fix12 SFPEW EGL unified/split A-B switch missing'
+          assert 'AME_EGL_ENTRY' in gb, 'fix12 unified EGL dispatch missing'
+          assert 'unified preflight failed' in gb, 'fix12 backend-bootstrap preflight auto-fallback missing'
+          assert 'ame_mgEarlyBootstrap' in gb, 'fix12 MG backend early bootstrap missing (gl_init would hit NULL backend egl handle)'
+          assert 'BEFORE first SFPEW EGL call' in gb, 'fix12 early bootstrap ordering assertion missing'
+          assert '[AME-EGL]' in gb, 'fix12 EGL per-stage diagnostic logging missing'
+          assert '[AME-DIAG]' in pathlib.Path('Natives/egl_bridge.m').read_text(), 'fix12 env snapshot diagnostic missing'
+          cp = pathlib.Path('Natives/external/MobileGL/MobileGL/MG_Compat/iOSLowVersionCompat.c').read_text()
+          assert 'ame_is_self_symbol' in cp, 'fix12 to_chars native-forward self-recursion guard missing'
+          assert 'AME_MOBILEGL_IOS_COMPAT_TRACE' in cp, 'fix12 to_chars polyfill sampling trace missing'
+          egl = pathlib.Path('Natives/external/MobileGlues/src/main/cpp/egl/egl.cpp').read_text()
+          assert egl.count('is unavailable in the backend') >= 30, 'MobileGlues EGL NULL guards incomplete (would still whack-a-mole)'
+          dn = pathlib.Path('Natives/external/SimpleFPEWrapper/SimpleFPEWrapper/fpe/draw_now.cpp').read_text()
+          assert '[AME-FPE]' in dn, 'fix13 SFPEW draw guard diagnostics missing'
+          assert 'ameFpeVboIndexedDrawSafe' in dn, 'fix13 SFPEW VBO-indexed draw preflight missing'
+          assert 'AME_FPE_DRAW_GUARD' in dn, 'fix13 SFPEW draw guard A/B switch missing'
+          assert 'SYMBOL-SPLIT' in dn, 'fix13 SFPEW flat-namespace symbol-split diagnostic missing'
+          assert 'ameFpeDrawElementsVBO' in dn, 'fix13 SFPEW draw call funnel missing'
+          assert 'AME_GUI_PRESENT_DIAG' in eb, 'fix13 GUI present diag A/B switch missing'
+          assert '[AME-GUI]' in eb, 'fix13 GUI present diagnostic logging missing'
+          assert 'NULL-ATTR' in dn, 'fix14 NULL client pointer guard missing'
+          assert 'ameFpeNullPointerClientAttrib' in dn, 'fix14 NULL-ATTR helper missing'
+          jl = pathlib.Path('Natives/JavaLauncher.m').read_text()
+          assert '[fix15][GL4ES-RTLD-GLOBAL]' in jl, 'fix15 holy gl4es RTLD_GLOBAL rationale missing'
+          assert 'strcmp(preloadName, RENDERER_NAME_GL4ES) == 0 ||' in jl, 'fix15 holy gl4es GL provider whitelist missing'
+          assert 'isGL4ESFamilyRenderer(preloadName)' in jl, 'fix15 gl4es-family GL provider whitelist missing'
+          assert 'keeps RTLD_GLOBAL' in jl, 'fix15 RTLD_GLOBAL skip diagnostic missing'
+          # [fix16] 保守清理 + 零额度构建通道 防回退断言
+          import re
+          vb16 = pathlib.Path('Natives/ctxbridges/vk_bridge.m').read_text()
+          assert '[fix16][DEAD-CODE]' in vb16, 'fix16 vk_bridge dead-bridge annotation missing'
+          eb16 = pathlib.Path('Natives/egl_bridge.m').read_text()
+          assert 'set_vk_bridge_tbl();' not in eb16, 'fix16: vk_bridge must stay unwired (26.2 OpenGL black-screen regression)'
+          # 去掉 // 行注释后再判定，避免 DEAD-CODE 说明注释里的函数名造成误报
+          gbh16 = re.sub(r'//[^\n]*', '', pathlib.Path('Natives/ctxbridges/gl4es_family_boot.h').read_text())
+          assert 'ame_gap_renderer_selected' not in gbh16, 'fix16 dead helper declaration still present'
+          gbm16 = re.sub(r'//[^\n]*', '', pathlib.Path('Natives/ctxbridges/gl4es_family_boot.m').read_text())
+          assert 'ame_gap_renderer_selected' not in gbm16, 'fix16 dead helper definition still present'
+          mk16 = pathlib.Path('Makefile').read_text()
+          assert 'RENDERER_GAP_EXTRAS ?= 0' in mk16, 'fix16: gap extras must stay opt-in by default'
+          assert '[fix16] 当前 main 状态' in pathlib.Path('RENDERER_GAP_PROVENANCE.md').read_text(), 'fix16 provenance status note missing'
+          by16 = pathlib.Path('.github/workflows/build.yml').read_text()
+          assert not re.search(r'^[ \t]+push:', by16, re.M), 'fix16: push trigger must stay disabled to avoid burning hosted minutes'
+          sh16 = pathlib.Path('.github/workflows/build-selfhosted.yml').read_text()
+          assert 'runs-on: [self-hosted, air-alternate]' in sh16, 'fix16 self-hosted workflow missing'
+          print('source state: VERIFIED (iOS MVK 1.4.2 / Mithril / Task55 / version-download fix / MobileGL iOS compat / iOS15 full-tree chained-fixups weak imports / fix12: MG backend early bootstrap BEFORE gl_init, SFPEW unified EGL route + preflight fallback, 31 EGL NULL guards, init short-circuits / AME-EGL + AME-DIAG diagnostics & to_chars trace / fix13: SFPEW draw 收口 guard + SYMBOL-SPLIT 诊断, GUI 呈现 A/B 开关)')
+          PY
+          # 防回退：只匹配真正以命令形式出现的 git clone；巡检语句自身以 "!" 开头，不会命中。
+          ! grep -qE '^[[:space:]]*git clone ' .github/workflows/build.yml || {
+            echo "::error::workflow still clones upstream"; exit 1; }
+
+
+      - name: Seed JRE runtimes from released IPA
+        # 上游 Makefile 的 jre 目标默认 wget assets.angelauramc.dev 上的 4 套 JRE，
+        # 该域名已失效。公开 Release 的 Air-5.1.0.ipa 内含完整 java-{8,17,21,25}-openjdk。
+        run: |
+          set -e
+          cd "$GITHUB_WORKSPACE"
+          mkdir -p .deps
+          if [ ! -f .deps/Air-5.1.0.ipa ]; then
+            curl -fsSL --retry 3 -m 900 -o .deps/Air-5.1.0.ipa \
+              "https://github.com/herbrine8403/Amethyst-iOS-MyRemastered/releases/download/5.1.0/Air-5.1.0.ipa"
+          fi
+          ls -lh .deps/Air-5.1.0.ipa
+          rm -rf .deps/ipa_extract && mkdir -p .deps/ipa_extract
+          unzip -q .deps/Air-5.1.0.ipa \
+            'Payload/AngelAuraAmethyst.app/java_runtimes/*' \
+            'Payload/AngelAuraAmethyst.app/Frameworks/libawt_xawt.dylib' \
+            -d .deps/ipa_extract
+          SRC=.deps/ipa_extract/Payload/AngelAuraAmethyst.app
+          mkdir -p depends Natives/build
+          for v in 8 17 21 25; do
+            test -f "$SRC/java_runtimes/java-$v-openjdk/release" || {
+              echo "::error::JRE $v release missing in released IPA"; exit 1; }
+            test -f "$SRC/java_runtimes/java-$v-openjdk/lib/server/libjvm.dylib" || {
+              echo "::error::JRE $v libjvm.dylib missing"; exit 1; }
+            rm -rf "depends/java-$v-openjdk"
+            cp -R "$SRC/java_runtimes/java-$v-openjdk" depends/
+          done
+          cp "$SRC/Frameworks/libawt_xawt.dylib" Natives/build/libawt_xawt.dylib
+          echo "== seeded JREs =="
+          du -sh depends/java-*-openjdk
+
+      - name: Build regular IPA
+        env:
+          IPHONEOS_DEPLOYMENT_TARGET: 14.0
+          BUILD_MOBILEGL: 1
+          RUNNER: 1
+        run: |
+          set -o pipefail
+          export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
+          export SLIMMED=0
+          mkdir -p ci-logs
+          gmake -j$(sysctl -n hw.ncpu) dsym package PLATFORM=2 2>&1 | tee ci-logs/ios-build.log
+
+      - name: Build TrollStore tipa
+        env:
+          IPHONEOS_DEPLOYMENT_TARGET: 14.0
+          BUILD_MOBILEGL: 0
+          RUNNER: 1
+        run: |
+          set -o pipefail
+          export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
+          export SLIMMED=0
+          gmake -j$(sysctl -n hw.ncpu) dsym package PLATFORM=2 TROLLSTORE_JIT_ENT=1 2>&1 | tee ci-logs/ios-build-trollstore.log
+
+      - name: Collect and rename outputs
+        run: |
+          set -e
+          mkdir -p dist
+          echo "== artifacts dir =="
+          ls -lh artifacts/ || true
+          IPA=$(find artifacts -maxdepth 1 -type f -name '*.ipa' ! -name '*trollstore*' | head -1)
+          TIPA=$(find artifacts -maxdepth 1 -type f -name '*trollstore*.tipa' | head -1)
+          [ -n "$IPA" ] || { echo "::error::no ipa produced"; exit 1; }
+          cp "$IPA" dist/Air-Alternate-6.0.0-ios.ipa
+          [ -n "$TIPA" ] && cp "$TIPA" dist/Air-Alternate-6.0.0-ios-trollstore.tipa || true
+          ls -lh dist/
+          echo "== bundle id / display name inside IPA =="
+          rm -rf /tmp/ipa_check && mkdir -p /tmp/ipa_check
+          unzip -o -q dist/Air-Alternate-6.0.0-ios.ipa 'Payload/AngelAuraAmethyst.app/Info.plist' -d /tmp/ipa_check
+          PLIST=/tmp/ipa_check/Payload/AngelAuraAmethyst.app/Info.plist
+          echo "CFBundleIdentifier = $(plutil -extract CFBundleIdentifier raw "$PLIST")"
+          echo "CFBundleDisplayName = $(plutil -extract CFBundleDisplayName raw "$PLIST")"
+          test "$(plutil -extract CFBundleIdentifier raw "$PLIST")" = "com.airalternate.amethyst" || { echo "::error::bundle id mismatch"; exit 1; }
+
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-selfhosted
+          path: ci-logs/
+          if-no-files-found: ignore
+
+      - name: Upload IPA artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Air-Alternate-IPA-selfhosted
+          path: dist/
+          if-no-files-found: error
+
+      - name: Publish Release (optional)
+        if: ${{ !inputs.skip_release }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if ! command -v gh >/dev/null 2>&1; then
+            echo "gh 未安装，跳过 Release 创建；产物已在 Artifacts 中。"
+            exit 0
+          fi
+          gh release create "air-alternate-sh-${{ github.run_number }}" dist/* \
+            --title "Air Alternate - self-hosted build ${{ github.run_number }}" \
+            --notes "fix16 self-hosted Mac build (0 hosted Actions minutes). 保守清理未接线的渲染器死代码，运行时行为与 fix15 一致。" \
+            || echo "release creation skipped"

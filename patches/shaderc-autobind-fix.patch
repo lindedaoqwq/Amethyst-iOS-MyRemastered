@@ -1,0 +1,213 @@
+--- a/Natives/shaderc_sandbox.h
++++ b/Natives/shaderc_sandbox.h
+@@ -67,6 +67,25 @@
+     char macro_name[AME_SB_MAX_MACROS][AME_SB_MACRO_NAME_MAX];
+     char macro_value[AME_SB_MAX_MACROS][AME_SB_MACRO_VALUE_MAX];
+     unsigned char macro_has_value[AME_SB_MAX_MACROS]; // 0 = 无值宏
++    // ---- Task 55：影响 glslang 编译行为的 flags --------------------------
++    // MC RenderPearl 26.3 的 #version 330 uniform/buffer block 不带
++    // layout(binding=X)，依赖 set_auto_bind_uniforms / set_auto_map_locations
++    // 让 glslang 自动分配（GLSLANG_SHADER_AUTO_MAP_BINDINGS / AUTO_MAP_LOCATIONS）。
++    // 这些 setter 原先只经 -reexport_library 透传到 impl：主进程 options 对象
++    // 配置正确，但影子注册表无从得知 → 沙箱子进程重建 options 时全部丢失 →
++    // Vulkan 1.2 语义下报 "uniform/buffer blocks require layout(binding=X)"，
++    // minecraft:pipeline/gui 等必需管线编译失败。关掉沙箱走进程内旧链路能跑
++    // 正印证此点（setter 在进程内路径直接作用于 MC 持有的 options 对象）。
++    // 现由 shaderc_shim.c 拦截对应 setter 写入，shaderc_sandbox.m 子进程重建
++    // options 时按这些字段调用同名 impl setter 还原。
++    int auto_bind_uniforms;
++    int auto_map_locations;
++    int vulkan_rules_relaxed;
++    int invert_y;
++    int nan_clamp;
++    int suppress_warnings;
++    int warnings_as_errors;
++    int auto_combined_image_sampler;
+ } ame_sb_opt_fields_t;
+ 
+ // ---- 沙箱结果对象（父进程 malloc，由 shim 的 result 访问器族识别/释放）----
+--- a/Natives/shaderc_sandbox.m
++++ b/Natives/shaderc_sandbox.m
+@@ -439,6 +439,18 @@
+     ame_sb_opt_fields_t default_opt;
+     memset(&default_opt, 0, sizeof default_opt);
+     if (opt == NULL) opt = &default_opt;
++    // Task 55：首个请求打印影子字段快照，便于在设备日志确认 auto-binding
++    // 是否已被 shaderc_shim.c 成功镜像（sandbox 保持开启时也应当为 1）。
++    static int s_t55_logged = 0;
++    if (!s_t55_logged) {
++        s_t55_logged = 1;
++        fprintf(stderr,
++                "[shaderc-sandbox] Task55 first request: auto_bind=%d auto_map=%d "
++                "vulkan_relaxed=%d macros=%d opt_blen=%u (sandbox ON)\n",
++                opt->auto_bind_uniforms, opt->auto_map_locations,
++                opt->vulkan_rules_relaxed, opt->macro_count,
++                (unsigned)sizeof(ame_sb_opt_fields_t));
++    }
+     const char *input = (input_file != NULL) ? input_file : "";
+     const char *ep = (entry_point != NULL) ? entry_point : "";
+     size_t input_len = strlen(input);
+@@ -538,6 +550,8 @@
+ typedef void (*ame_impl_set_env_fn)(void *, int, unsigned);
+ typedef void (*ame_impl_set_vp_fn)(void *, int, int);
+ typedef void (*ame_impl_macro_fn)(void *, const char *, size_t, const char *, size_t);
++// Task 55：无参 options flag setter（auto_bind_uniforms / auto_map_locations ...）
++typedef void (*ame_impl_flag_fn)(void *);
+ typedef int (*ame_impl_result_status_fn)(void *);
+ typedef const char *(*ame_impl_result_bytes_fn)(void *);
+ typedef size_t (*ame_impl_result_len_fn)(void *);
+@@ -559,6 +573,16 @@
+     ame_impl_set_int_fn opt_set_dbg;
+     ame_impl_set_vp_fn opt_set_vp;
+     ame_impl_macro_fn opt_macro;
++    // Task 55：Vulkan auto-binding 等编译行为 flags 的 impl setter。
++    // dlsym 可选——老 impl 缺符号时保持 NULL，调用点判空跳过，不致命。
++    ame_impl_flag_fn opt_set_auto_bind;
++    ame_impl_flag_fn opt_set_auto_map;
++    ame_impl_flag_fn opt_set_vulkan_relaxed;
++    ame_impl_flag_fn opt_set_invert_y;
++    ame_impl_flag_fn opt_set_nan_clamp;
++    ame_impl_flag_fn opt_set_suppress_warnings;
++    ame_impl_flag_fn opt_set_warnings_as_errors;
++    ame_impl_flag_fn opt_set_auto_combined;
+     ame_impl_release_fn result_release;
+     ame_impl_result_status_fn result_status;
+     ame_impl_result_bytes_fn result_spv_bytes;
+@@ -599,6 +623,16 @@
+     impl->opt_set_dbg = (ame_impl_set_int_fn)dlsym(h, "shaderc_compile_options_set_generate_debug_info");
+     impl->opt_set_vp = (ame_impl_set_vp_fn)dlsym(h, "shaderc_compile_options_set_forced_version_profile");
+     impl->opt_macro = (ame_impl_macro_fn)dlsym(h, "shaderc_compile_options_add_macro_definition");
++    // Task 55：MC 26.3 的 #version 330 uniform block 依赖 auto-binding，
++    // 子进程重建 options 时必须能调用到这些 setter。
++    impl->opt_set_auto_bind = (ame_impl_flag_fn)dlsym(h, "shaderc_compile_options_set_auto_bind_uniforms");
++    impl->opt_set_auto_map = (ame_impl_flag_fn)dlsym(h, "shaderc_compile_options_set_auto_map_locations");
++    impl->opt_set_vulkan_relaxed = (ame_impl_flag_fn)dlsym(h, "shaderc_compile_options_set_vulkan_rules_relaxed");
++    impl->opt_set_invert_y = (ame_impl_flag_fn)dlsym(h, "shaderc_compile_options_set_invert_y");
++    impl->opt_set_nan_clamp = (ame_impl_flag_fn)dlsym(h, "shaderc_compile_options_set_nan_clamp");
++    impl->opt_set_suppress_warnings = (ame_impl_flag_fn)dlsym(h, "shaderc_compile_options_set_suppress_warnings");
++    impl->opt_set_warnings_as_errors = (ame_impl_flag_fn)dlsym(h, "shaderc_compile_options_set_warnings_as_errors");
++    impl->opt_set_auto_combined = (ame_impl_flag_fn)dlsym(h, "shaderc_compile_options_set_auto_combined_image_sampler");
+     impl->result_release = (ame_impl_release_fn)dlsym(h, "shaderc_result_release");
+     impl->result_status = (ame_impl_result_status_fn)dlsym(h, "shaderc_result_get_compilation_status");
+     impl->result_spv_bytes = (ame_impl_result_bytes_fn)dlsym(h, "shaderc_result_get_spv_bytes");
+@@ -619,8 +653,10 @@
+         (ame_glslang_void_fn)dlsym(h, "_ZN7glslang15FinalizeProcessEv");
+     impl->compiler = compiler_init();
+     if (impl->compiler == NULL) return -1;
+-    sb_clog("[shaderc-sandbox] child: impl loaded (glslang rebuild %s)\n",
+-            (impl->glslang_init && impl->glslang_fini) ? "armed" : "unavailable");
++    sb_clog("[shaderc-sandbox] child: impl loaded (glslang rebuild %s, "
++            "auto-bind setter %s -- Task 55)\n",
++            (impl->glslang_init && impl->glslang_fini) ? "armed" : "unavailable",
++            impl->opt_set_auto_bind ? "present" : "MISSING");
+     return 0;
+ }
+ 
+@@ -707,6 +743,38 @@
+                     im->opt_macro(job->options, name, strlen(name), NULL, 0);
+                 }
+             }
++            // ---- Task 55：还原 Vulkan auto-binding / 编译行为 flags ----
++            // MC 26.3 的 #version 330 uniform/buffer block 不带
++            // layout(binding=X)，必须让 glslang 自动分配 binding/location
++            // （GLSLANG_SHADER_AUTO_MAP_BINDINGS / AUTO_MAP_LOCATIONS）。
++            // 影子字段由 shaderc_shim.c 拦截对应 setter 写入；缺它们时
++            // Vulkan 1.2 语义下 gui 等管线编译失败。
++            if (job->opt.auto_bind_uniforms && im->opt_set_auto_bind)
++                im->opt_set_auto_bind(job->options);
++            if (job->opt.auto_map_locations && im->opt_set_auto_map)
++                im->opt_set_auto_map(job->options);
++            if (job->opt.vulkan_rules_relaxed && im->opt_set_vulkan_relaxed)
++                im->opt_set_vulkan_relaxed(job->options);
++            if (job->opt.invert_y && im->opt_set_invert_y)
++                im->opt_set_invert_y(job->options);
++            if (job->opt.nan_clamp && im->opt_set_nan_clamp)
++                im->opt_set_nan_clamp(job->options);
++            if (job->opt.suppress_warnings && im->opt_set_suppress_warnings)
++                im->opt_set_suppress_warnings(job->options);
++            if (job->opt.warnings_as_errors && im->opt_set_warnings_as_errors)
++                im->opt_set_warnings_as_errors(job->options);
++            if (job->opt.auto_combined_image_sampler && im->opt_set_auto_combined)
++                im->opt_set_auto_combined(job->options);
++            // 兜底：两个关键标志都没被影子记录（调用方绕过 shim 直接拿到
++            // impl 符号、或旧版 options 快照）时仍强制开启。进程内旧链路
++            // （已验证可进游戏）的 options 必然开了这两项；Vulkan SPIR-V
++            // 缺它们根本无法从 #version 330 uniform block 生成。
++            if (!job->opt.auto_bind_uniforms && !job->opt.auto_map_locations) {
++                if (im->opt_set_auto_bind) im->opt_set_auto_bind(job->options);
++                if (im->opt_set_auto_map) im->opt_set_auto_map(job->options);
++                sb_clog("[shaderc-sandbox] child: auto-binding flags absent in "
++                        "shadow -- forced on for MC 26.3 Vulkan uniform blocks\n");
++            }
+         }
+ 
+         ame_impl_compile_fn fn = (job->entry == 1) ? im->into_asm
+--- a/Natives/shaderc_shim.c
++++ b/Natives/shaderc_shim.c
+@@ -491,6 +491,15 @@
+                 opt->target_env, opt->target_env_version, opt->source_language,
+                 opt->optimization_level, opt->generate_debug, opt->has_forced,
+                 opt->forced_version, opt->forced_profile, opt->macro_count);
++        // Task 55：把编译行为 flags 一并落盘，便于核对影子字段是否记录成功
++        fprintf(m, "auto_bind_uniforms=%d\nauto_map_locations=%d\n"
++                   "vulkan_rules_relaxed=%d\ninvert_y=%d\nnan_clamp=%d\n"
++                   "suppress_warnings=%d\nwarnings_as_errors=%d\n"
++                   "auto_combined_image_sampler=%d\n",
++                opt->auto_bind_uniforms, opt->auto_map_locations,
++                opt->vulkan_rules_relaxed, opt->invert_y, opt->nan_clamp,
++                opt->suppress_warnings, opt->warnings_as_errors,
++                opt->auto_combined_image_sampler);
+         for (int i = 0; i < opt->macro_count && i < AME_SB_MAX_MACROS; ++i) {
+             if (opt->macro_has_value[i]) {
+                 fprintf(m, "macro[%d]=%s=%s\n", i, opt->macro_name[i],
+@@ -743,6 +752,15 @@
+             case 0: e->fields.source_language = value; break;
+             case 1: e->fields.optimization_level = value; break;
+             case 2: e->fields.generate_debug = value; break;
++            // Task 55：影响 glslang 编译行为的 flags（沙箱子进程需还原）
++            case 3: e->fields.auto_bind_uniforms = value; break;
++            case 4: e->fields.auto_map_locations = value; break;
++            case 5: e->fields.vulkan_rules_relaxed = value; break;
++            case 6: e->fields.invert_y = value; break;
++            case 7: e->fields.nan_clamp = value; break;
++            case 8: e->fields.suppress_warnings = value; break;
++            case 9: e->fields.warnings_as_errors = value; break;
++            case 10: e->fields.auto_combined_image_sampler = value; break;
+         }
+     }
+     pthread_mutex_unlock(&ame_opt_shadow_lock);
+@@ -1638,6 +1656,34 @@
+     ame_opt_shadow_set_vp(options, version, profile); // Task 42 影子镜像
+ }
+ 
++// ---- Task 55：补齐 options flags 的影子镜像 ------------------------------
++// 这 8 个无参 setter 原本只经 -reexport_library 透传到 impl：主进程的
++// options 对象配置是正确的，但影子注册表不知道，沙箱子进程重建 options
++// 时全部丢失。MC 26.3 的 #version 330 uniform block 因此报
++// "uniform/buffer blocks require layout(binding=X)"（minecraft:pipeline/gui
++// 编译失败 → 启动崩溃）。关掉沙箱走进程内旧链路能跑，正因为这些 setter
++// 在进程内路径直接作用于 MC 持有的 options 对象。此处转发 impl 并镜像到
++// 影子表；shaderc_sandbox.m 的子进程按 ame_sb_opt_fields_t 调用同名 impl
++// setter 重建等价 options，沙箱保持开启即可正常编译。
++#define AME_SHADERC_FLAG_SETTER(fn, which)                                     \
++void fn(void *options) {                                                       \
++    void *real = ame_shaderc_shim_resolve(#fn);                                \
++    if (real == NULL || options == NULL) return;                              \
++    ((void (*)(void *))real)(options);                                        \
++    ame_opt_shadow_set_int(options, which, 1);                                \
++    fprintf(stderr, "[shaderc-shim] options_set: " #fn " (opt=%p t=%.0fms)\n", \
++            options, ame_shim_ms());                                          \
++}
++AME_SHADERC_FLAG_SETTER(shaderc_compile_options_set_auto_bind_uniforms, 3)
++AME_SHADERC_FLAG_SETTER(shaderc_compile_options_set_auto_map_locations, 4)
++AME_SHADERC_FLAG_SETTER(shaderc_compile_options_set_vulkan_rules_relaxed, 5)
++AME_SHADERC_FLAG_SETTER(shaderc_compile_options_set_invert_y, 6)
++AME_SHADERC_FLAG_SETTER(shaderc_compile_options_set_nan_clamp, 7)
++AME_SHADERC_FLAG_SETTER(shaderc_compile_options_set_suppress_warnings, 8)
++AME_SHADERC_FLAG_SETTER(shaderc_compile_options_set_warnings_as_errors, 9)
++AME_SHADERC_FLAG_SETTER(shaderc_compile_options_set_auto_combined_image_sampler, 10)
++#undef AME_SHADERC_FLAG_SETTER
++
+ void *shaderc_compile_into_spv(void *compiler, const char *source, size_t source_size,
+                                int kind, const char *input_file, const char *entry_point,
+                                void *options) {

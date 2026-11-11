@@ -1,0 +1,2 @@
+tools/trace_replay/fixtures/openra.tgz -filter -diff -merge -text
+tools/trace_replay/fixtures/openra.0000031249.png -filter -diff -merge -text

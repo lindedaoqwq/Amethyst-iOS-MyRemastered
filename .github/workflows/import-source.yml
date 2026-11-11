@@ -1,0 +1,179 @@
+name: Import upstream source (one-shot)
+
+# 方案 A：把完整上游源码一次性搬进本仓库，并把所有定制固化进源码。
+# 运行一次后，build.yml 改为 checkout 自身，不再 clone 上游、不再打补丁。
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: air-alternate-import
+  cancel-in-progress: false
+
+env:
+  GIT_LFS_SKIP_SMUDGE: 1
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Checkout this repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "air-alternate-bot"
+          git config user.email "air-alternate-bot@users.noreply.github.com"
+          git config http.version HTTP/1.1
+          git config http.postBuffer 524288000
+
+      - name: Clone upstream with submodules
+        run: |
+          set -e
+          rm -rf /tmp/upstream
+          git clone --depth 1 https://github.com/herbrine8403/Amethyst-iOS-MyRemastered.git /tmp/upstream
+          cd /tmp/upstream
+          echo "upstream HEAD: $(git rev-parse HEAD)"
+          git submodule update --init --recursive --depth 1 || git submodule update --init --recursive
+          echo "== upstream sanity =="
+          test -f Makefile
+          test -f Natives/Info.plist
+          test -f Natives/resources/Frameworks/libmithril.dylib
+          test -f Natives/external/ZeroTierFramework/ios-example-app/zt.framework/zt || {
+            echo "::error::ZeroTier zt.framework missing after submodule init"; exit 1; }
+          du -sh .
+
+      - name: Apply code patches
+        run: |
+          set -e
+          cd /tmp/upstream
+          for p in amethyst-changes.patch shaderc-autobind-fix.patch version-download-fix.patch; do
+            f="$GITHUB_WORKSPACE/patches/$p"
+            test -f "$f" || { echo "::error::missing patch $p"; exit 1; }
+            git apply --check "$f" || { echo "::error::$p does not apply to upstream"; exit 1; }
+            git apply "$f"
+            echo "$p APPLIED"
+          done
+          python3 - <<'PY'
+          import pathlib
+          checks = [
+              ('Natives/LauncherPreferences.m', '@"key": @ RENDERER_NAME_MITHRIL'),
+              ('Natives/shaderc_sandbox.h', 'int auto_bind_uniforms;'),
+              ('Natives/DownloadViewController.m', 'AMEFetchVersionManifest'),
+          ]
+          for path, needle in checks:
+              assert needle in pathlib.Path(path).read_text(), f'{path} missing {needle!r}'
+          print('all three patches VERIFIED in source')
+          PY
+
+      - name: Bake rebrand into source
+        run: |
+          set -e
+          cd /tmp/upstream
+          python3 - <<'PY'
+          import pathlib, plistlib
+          OLD, NEW = b'com.air-devs.air', b'com.airalternate.amethyst'
+
+          pl = pathlib.Path('Natives/Info.plist')
+          with pl.open('rb') as f:
+              data = plistlib.load(f)
+          data['CFBundleDisplayName'] = 'Air Alternate'
+          data['CFBundleName'] = 'Air Alternate'
+          data['CFBundleIdentifier'] = NEW.decode()
+          with pl.open('wb') as f:
+              plistlib.dump(data, f)
+          # URL scheme <string>amethyst</string> 仅出现在 CFBundleURLSchemes
+          pl.write_bytes(pl.read_bytes().replace(b'<string>amethyst</string>',
+                                                b'<string>airalternate</string>'))
+
+          changed = 0
+          for p in pathlib.Path('.').rglob('*'):
+              if not p.is_file() or '.git' in p.parts:
+                  continue
+              raw = p.read_bytes()
+              if b'\x00' in raw or OLD not in raw:
+                  continue
+              p.write_bytes(raw.replace(OLD, NEW))
+              changed += 1
+          print(f'rebranded {changed} text files')
+          with pl.open('rb') as f:
+              d = plistlib.load(f)
+          assert d['CFBundleIdentifier'] == 'com.airalternate.amethyst'
+          assert d['CFBundleDisplayName'] == 'Air Alternate'
+          print('bundle identity baked:', d['CFBundleIdentifier'], '/', d['CFBundleDisplayName'])
+          PY
+
+      - name: Bake MoltenVK iOS 1.4.2
+        run: |
+          set -e
+          cd /tmp/upstream
+          curl -fsSL --retry 3 -o /tmp/MoltenVK-ios.tar \
+            "https://github.com/KhronosGroup/MoltenVK/releases/download/v1.4.2/MoltenVK-ios.tar"
+          rm -rf /tmp/mvk && mkdir -p /tmp/mvk
+          tar -xf /tmp/MoltenVK-ios.tar -C /tmp/mvk
+          BIN=$(find /tmp/mvk -type f -path '*ios-arm64/MoltenVK.framework/MoltenVK' | head -1)
+          test -n "$BIN" || { echo "::error::iOS arm64 MoltenVK binary not found"; exit 1; }
+          cp "$BIN" Natives/resources/Frameworks/libMoltenVK.dylib
+          python3 - <<'PY'
+          import pathlib
+          d = pathlib.Path('Natives/resources/Frameworks/libMoltenVK.dylib').read_bytes()
+          assert len(d) > 1000000 and d[:4] == b'\xcf\xfa\xed\xfe', 'not a Mach-O binary'
+          assert b'1.4.2' in d and b'1.2.9' not in d, 'not iOS 1.4.2'
+          print('MoltenVK iOS 1.4.2 baked:', len(d), 'bytes')
+          PY
+
+      - name: Make source self-contained (drop gitlink / LFS dependency)
+        run: |
+          set -e
+          cd /tmp/upstream
+          # submodule 内容已在前面 clone 下来：移除其 .git 索引与 .gitmodules，
+          # 让内容作为普通文件提交，构建时不再需要任何外部仓库。
+          find . -mindepth 2 -name .git -exec rm -rf {} + || true
+          rm -f .gitmodules
+          python3 - <<'PY'
+          import pathlib
+          for p in pathlib.Path('.').rglob('.gitattributes'):
+              lines = [l for l in p.read_text(errors='replace').splitlines(True)
+                       if 'filter=lfs' not in l]
+              p.write_text(''.join(lines))
+              print('cleaned LFS rules in', p)
+          PY
+          rm -rf .git
+          echo "== vendored framework =="
+          ls -l Natives/external/ZeroTierFramework/ios-example-app/zt.framework/zt
+          echo "== top level =="
+          ls | head -30
+          du -sh .
+
+      - name: Assemble repository, commit and push
+        run: |
+          set -e
+          cd "$GITHUB_WORKSPACE"
+          mkdir -p scripts
+          cp ci/prepare.sh.new scripts/prepare.sh
+          chmod +x scripts/prepare.sh
+          # 拷贝上游全部源码；排除 .git 与上游 .github（CI 完全由本仓库控制）
+          #
+          # 关键：本次 commit 绝不修改 .github/workflows/*。GitHub App (GITHUB_TOKEN)
+          # 没有 workflows 权限，push 中一旦包含 workflow 文件变更会被服务端拒绝。
+          # build.yml 的切换由仓库所有者的 classic token 经 REST API 单独提交。
+          rsync -a --exclude='.git' --exclude='.github' /tmp/upstream/ "$GITHUB_WORKSPACE"/
+          # rsync 后再覆盖一次，确保脚本是本仓库的版本
+          cp ci/prepare.sh.new scripts/prepare.sh
+          chmod +x scripts/prepare.sh
+          rm -f ci/build.yml.new ci/prepare.sh.new
+          rmdir ci 2>/dev/null || true
+          rm -f .git/hooks/pre-push
+          git add -A -f
+          echo "staged files: $(git diff --cached --name-only | wc -l)"
+          git status --short | head -15
+          git commit -m "feat: vendor full upstream source and bake all customizations (CI switch follows)"
+          git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          git push origin HEAD:main
+          echo "== pushed =="
+          git rev-parse HEAD

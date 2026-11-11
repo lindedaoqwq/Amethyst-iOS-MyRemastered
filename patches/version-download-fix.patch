@@ -1,0 +1,354 @@
+--- a/Natives/DownloadViewController.m
++++ b/Natives/DownloadViewController.m
+@@ -18,6 +18,9 @@
+ #import "DataPackService.h"
+ #import "PLProfiles.h"
+ #import "LauncherPreferences.h"
++// 版本清单 / version JSON 统一走镜像中心的官方↔BMCLAPI 候选链，
++// 与 MinecraftResourceDownloadTask / PLDownloadClient 保持一致，避免单点失败。
++#import "PLMirrorCenter.h"
+ #import "VersionCardCell.h"
+ #import "MinecraftResourceDownloadTask.h"
+ #import "MinecraftResourceUtils.h"
+@@ -480,6 +483,8 @@
+ 
+ @property (nonatomic, strong) NSArray *versionList;
+ @property (nonatomic, strong) NSArray *filteredVersions;
++// 版本清单 / version JSON 拉取失败时记录各候选源的具体原因，供错误提示展示
++@property (nonatomic, strong) NSString *lastVersionFetchError;
+ @property (nonatomic, strong) NSMutableArray *modList;
+ @property (nonatomic, strong) NSMutableArray *shaderList;
+ 
+@@ -1885,45 +1890,181 @@
+     [self presentViewController:nav animated:YES completion:nil];
+ }
+ 
++#pragma mark - Version manifest: cache + multi-source fetch
++
++/// 版本清单磁盘缓存：进页面先读缓存立即渲染，避免每次都等网络；
++/// 断网或官方源不可达时仍能显示上次成功的版本列表。
++static NSString *AMEVersionManifestCachePath(void) {
++    NSString *dir = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject;
++    return [dir stringByAppendingPathComponent:@"ame_version_manifest_v2.json"];
++}
++
++static NSString *const AMEVersionManifestOfficialURL = @"https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
++
++/// 校验一段数据是否为合法的 version_manifest_v2 JSON
++static NSArray *AMEParseVersionManifest(NSData *data) {
++    if (data.length == 0) return nil;
++    NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL];
++    if (![json isKindOfClass:[NSDictionary class]]) return nil;
++    NSArray *versions = json[@"versions"];
++    if (![versions isKindOfClass:[NSArray class]] || versions.count == 0) return nil;
++    return versions;
++}
++
++/// 单个候选 URL 的同步拉取（带超时 / UA / HTTP 状态校验）。
++/// 仅供后台队列调用；成功返回 data，失败返回 nil 并通过 outReason 回填可辨识原因。
++static NSData *AMEFetchDataFromURL(NSURL *url, NSString **outReason) {
++    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
++    req.timeoutInterval = 12.0;
++    req.cachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
++    [req setValue:@"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
++          forHTTPHeaderField:@"User-Agent"];
++
++    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
++    __block NSData *result = nil;
++    __block NSInteger statusCode = 0;
++    __block NSError *netError = nil;
++    NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:req
++                                                              completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
++        netError = error;
++        if ([response isKindOfClass:[NSHTTPURLResponse class]]) {
++            statusCode = ((NSHTTPURLResponse *)response).statusCode;
++        }
++        if (!error && statusCode >= 200 && statusCode < 300) result = data;
++        dispatch_semaphore_signal(sem);
++    }];
++    [task resume];
++    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(15 * NSEC_PER_SEC)));
++
++    if (result) return result;
++    if (outReason) {
++        *outReason = netError
++            ? [NSString stringWithFormat:@"%@: %@", url.host, netError.localizedDescription]
++            : [NSString stringWithFormat:@"%@: HTTP %ld", url.host, (long)statusCode];
++    }
++    return nil;
++}
++
++/// 按 PLMirrorCenter 当前策略生成候选 URL 链（官方 ↔ BMCLAPI 镜像，去重、有序）。
++static NSArray<NSURL *> *AMEVersionCandidatesForURL(NSURL *original) {
++    NSArray<NSURL *> *candidates = [PLMirrorCenter candidateURLsForOriginalURL:original
++                                                                 resourceType:PLMirrorResourceTypeGameFile];
++    if (candidates.count == 0) candidates = @[original];
++    return candidates;
++}
++
++/// 串行尝试候选链拉取版本清单：每个候选最多 2 次尝试，校验 HTTP 状态与 JSON 结构，
++/// 成功后原子写入磁盘缓存。全部失败返回 nil 并汇总各源原因。
++static NSData *AMEFetchVersionManifest(NSString **outReason) {
++    NSURL *official = [NSURL URLWithString:AMEVersionManifestOfficialURL];
++    NSArray<NSURL *> *candidates = AMEVersionCandidatesForURL(official);
++    NSMutableArray<NSString *> *reasons = [NSMutableArray array];
++
++    for (NSURL *candidate in candidates) {
++        for (NSInteger attempt = 0; attempt < 2; ++attempt) {
++            NSString *reason = nil;
++            NSData *data = AMEFetchDataFromURL(candidate, &reason);
++            NSArray *versions = AMEParseVersionManifest(data);
++            if (versions) {
++                [data writeToFile:AMEVersionManifestCachePath() options:NSDataWritingAtomic error:NULL];
++                NSLog(@"[DownloadVC] version manifest OK via %@ (%lu versions)", candidate.host, (unsigned long)versions.count);
++                return data;
++            }
++            [reasons addObject:reason ?: [NSString stringWithFormat:@"%@: invalid JSON", candidate.host]];
++            if (attempt == 0) [NSThread sleepForTimeInterval:0.5];
++        }
++        NSLog(@"[DownloadVC] version manifest candidate failed: %@", candidate.host);
++    }
++    if (outReason) *outReason = [reasons componentsJoinedByString:@" / "];
++    return nil;
++}
++
++/// 串行尝试候选链拉取单个 version JSON（校验为含 downloads 的字典）。
++static NSData *AMEFetchVersionJSON(NSURL *originalURL, NSString **outReason) {
++    NSArray<NSURL *> *candidates = AMEVersionCandidatesForURL(originalURL);
++    NSMutableArray<NSString *> *reasons = [NSMutableArray array];
++
++    for (NSURL *candidate in candidates) {
++        for (NSInteger attempt = 0; attempt < 2; ++attempt) {
++            NSString *reason = nil;
++            NSData *data = AMEFetchDataFromURL(candidate, &reason);
++            NSDictionary *parsed = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL] : nil;
++            if ([parsed isKindOfClass:[NSDictionary class]] && parsed.count > 0) {
++                NSLog(@"[DownloadVC] version JSON OK via %@", candidate.host);
++                return data;
++            }
++            [reasons addObject:reason ?: [NSString stringWithFormat:@"%@: invalid JSON", candidate.host]];
++            if (attempt == 0) [NSThread sleepForTimeInterval:0.5];
++        }
++    }
++    if (outReason) *outReason = [reasons componentsJoinedByString:@" / "];
++    return nil;
++}
++
+ #pragma mark - Data Loading
+ 
+ - (void)loadVersionList {
+-    [self.loadingIndicator startAnimating];
+-    
+-    NSString *downloadSource = getPrefObject(@"general.download_source");
+-    NSString *versionManifestURL;
+-    
+-    if ([downloadSource isEqualToString:@"bmclapi"]) {
+-        versionManifestURL = @"https://bmclapi2.bangbang93.com/mc/game/version_manifest_v2.json";
++    // 1) 先读磁盘缓存立即渲染：秒开，断网 / 官方源不可达时仍能看到上次成功的版本列表。
++    //    旧实现每次进页面都单次直连单一源，源不可达就整张列表空白 —— 这是「版本列表老是加载不出来」的根因。
++    NSArray *cachedVersions = AMEParseVersionManifest([NSData dataWithContentsOfFile:AMEVersionManifestCachePath()]);
++    if (cachedVersions) {
++        self.versionList = cachedVersions;
++        [self applyVersionFilter];
++        NSLog(@"[DownloadVC] version list rendered from cache (%lu items)", (unsigned long)cachedVersions.count);
+     } else {
+-        versionManifestURL = @"https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
++        [self.loadingIndicator startAnimating];
+     }
+-    
+-    NSURL *url = [NSURL URLWithString:versionManifestURL];
++
++    // 2) 后台走官方↔BMCLAPI 候选链刷新（PLMirrorCenter 按当前策略排序，逐源重试 + HTTP 状态校验）。
+     __weak typeof(self) weakSelf = self;
+-    NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithURL:url completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
++    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
++        NSString *reason = nil;
++        NSData *fresh = AMEFetchVersionManifest(&reason);
++        NSArray *versions = AMEParseVersionManifest(fresh);
+         dispatch_async(dispatch_get_main_queue(), ^{
+             __strong typeof(weakSelf) strongSelf = weakSelf;
+             if (!strongSelf) return;
+             [strongSelf.loadingIndicator stopAnimating];
+-            
+-            if (data && !error) {
+-                NSError *jsonError;
+-                NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:&jsonError];
+-                if (json && !jsonError) {
+-                    strongSelf.versionList = json[@"versions"];
+-                    [strongSelf applyVersionFilter];
+-                } else {
+-                    strongSelf.emptyLabel.text = localize(@"i18n_str_176", nil);
+-                    strongSelf.emptyLabel.hidden = NO;
+-                }
+-            } else {
+-                strongSelf.emptyLabel.text = localize(@"i18n_str_177", nil);
+-                strongSelf.emptyLabel.hidden = NO;
++
++            if (versions) {
++                strongSelf.lastVersionFetchError = nil;
++                strongSelf.versionList = versions;
++                [strongSelf applyVersionFilter];
++                return;
++            }
++
++            strongSelf.lastVersionFetchError = reason;
++            NSLog(@"[DownloadVC] version manifest refresh failed: %@", reason);
++
++            if (strongSelf.versionList.count > 0) {
++                // 有缓存：静默保留已渲染的列表，后台刷新失败不打断用户
++                return;
+             }
++
++            // 无缓存：给出带具体失败原因与「重试」的可操作提示，而不是一句笼统的「网络错误」
++            strongSelf.emptyLabel.text = localize(@"i18n_str_177", nil);
++            strongSelf.emptyLabel.hidden = NO;
++
++            NSString *message = [NSString stringWithFormat:@"%@\n\n%@\n\n%@",
++                                 localize(@"i18n_str_177", nil),
++                                 reason ?: @"",
++                                 localize(@"preference.detail.download_source", nil)];
++            UIAlertController *alert = [UIAlertController alertControllerWithTitle:localize(@"i18n_str_42", nil)
++                                                                          message:message
++                                                                   preferredStyle:UIAlertControllerStyleAlert];
++            [alert addAction:[UIAlertAction actionWithTitle:localize(@"resman.common.cancel", nil)
++                                                      style:UIAlertActionStyleCancel handler:nil]];
++            [alert addAction:[UIAlertAction actionWithTitle:localize(@"i18n_str_21", nil)
++                                                      style:UIAlertActionStyleDefault
++                                                    handler:^(UIAlertAction * _Nonnull action) {
++                [strongSelf loadVersionList];
++            }]];
++            alert.popoverPresentationController.sourceView = strongSelf.view;
++            alert.popoverPresentationController.sourceRect = CGRectMake(CGRectGetMidX(strongSelf.view.bounds),
++                                                                        CGRectGetMidY(strongSelf.view.bounds), 0, 0);
++            [strongSelf presentViewController:alert animated:YES completion:nil];
+         });
+-    }];
+-    [task resume];
++    });
+ }
+ 
+ - (void)versionFilterChanged:(UISegmentedControl *)sender {
+@@ -2979,13 +3120,18 @@
+         // 内部注册的下载任务（autoPresentDetail=YES）自动弹出统一进度页，
+         // 此处不再创建底部悬浮进度卡片。
+         __weak typeof(self) weakSelf = self;
++        self.lastVersionFetchError = nil;
+         [self ensureVanillaInstalled:version completion:^(BOOL success) {
+             __strong typeof(weakSelf) strongSelf = weakSelf;
+             if (!strongSelf) return;
+             if (success) {
+                 [strongSelf downloadVanillaVersion:version];
+             } else {
+-                [strongSelf showError:[NSString stringWithFormat:localize(@"i18n_str_194", nil), versionId]];
++                NSString *message = [NSString stringWithFormat:localize(@"i18n_str_194", nil), versionId];
++                if (strongSelf.lastVersionFetchError.length) {
++                    message = [message stringByAppendingFormat:@"\n%@", strongSelf.lastVersionFetchError];
++                }
++                [strongSelf showError:message];
+             }
+         }];
+         return;
+@@ -3078,39 +3224,18 @@
+ 
+     NSLog(@"[DownloadVC] Vanilla version JSON missing, downloading: %@", versionId);
+ 
+-    // 2. 在后台线程拉取 Mojang 版本清单并下载 version JSON
++    // 2. 后台走官方↔BMCLAPI 候选链拉取版本清单（逐源重试 + 超时 + HTTP 状态校验 + 磁盘缓存）
+     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+-        NSString *downloadSource = getPrefObject(@"general.download_source") ?: @"official";
+-        BOOL useBMCLAPI = [downloadSource isEqualToString:@"bmclapi"];
+-        NSString *manifestURL = useBMCLAPI
+-            ? @"https://bmclapi2.bangbang93.com/mc/game/version_manifest_v2.json"
+-            : @"https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
+-
+-        NSURL *url = [NSURL URLWithString:manifestURL];
+-        if (!url) {
+-            if (completion) dispatch_async(dispatch_get_main_queue(), ^{ completion(NO); });
+-            return;
+-        }
+-
+-        NSMutableURLRequest *manifestRequest = [NSMutableURLRequest requestWithURL:url];
+-        manifestRequest.timeoutInterval = 30.0;
+-        manifestRequest.cachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
+-        [manifestRequest setValue:@"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15" forHTTPHeaderField:@"User-Agent"];
+-
+-        // 使用 NSURLSession 替代已废弃的 NSURLConnection sendSynchronousRequest
+-        dispatch_semaphore_t manifestSem = dispatch_semaphore_create(0);
+-        __block NSData *manifestData = nil;
+-        NSURLSessionDataTask *manifestTask = [[NSURLSession sharedSession] dataTaskWithRequest:manifestRequest
+-                                                                              completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+-            manifestData = data;
+-            dispatch_semaphore_signal(manifestSem);
+-        }];
+-        [manifestTask resume];
+-        dispatch_semaphore_wait(manifestSem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30 * NSEC_PER_SEC)));
+-
++        __weak typeof(self) weakSelf = self;
++        NSString *manifestReason = nil;
++        NSData *manifestData = AMEFetchVersionManifest(&manifestReason);
+         if (!manifestData) {
+-            NSLog(@"[DownloadVC] Failed to download version manifest");
+-            if (completion) dispatch_async(dispatch_get_main_queue(), ^{ completion(NO); });
++            NSLog(@"[DownloadVC] Failed to download version manifest: %@", manifestReason);
++            dispatch_async(dispatch_get_main_queue(), ^{
++                __strong typeof(weakSelf) ss = weakSelf;
++                if (ss) ss.lastVersionFetchError = manifestReason;
++                if (completion) completion(NO);
++            });
+             return;
+         }
+ 
+@@ -3136,42 +3261,23 @@
+             return;
+         }
+ 
+-        // BMCLAPI 镜像：替换 Mojang 官方域名
+-        if (useBMCLAPI) {
+-            versionJSONURL = [versionJSONURL stringByReplacingOccurrencesOfString:@"piston-meta.mojang.com"
+-                                                                        withString:@"bmclapi2.bangbang93.com"];
+-            versionJSONURL = [versionJSONURL stringByReplacingOccurrencesOfString:@"launchermeta.mojang.com"
+-                                                                        withString:@"bmclapi2.bangbang93.com"];
+-        }
+-
+-        // 4. 下载 version JSON（使用 NSURLSession 替代已废弃的 NSURLConnection）
++        // 4. 下载 version JSON：同样走候选链。PLMirrorCenter 会把 piston-meta /
++        //    launchermeta / piston-data 自动映射为 BMCLAPI，官方源作回退，
++        //    不再按 general.download_source 硬编码单源（原实现单源失败即整个安装失败）。
+         NSURL *jsonURL = [NSURL URLWithString:versionJSONURL];
+         if (!jsonURL) {
+             if (completion) dispatch_async(dispatch_get_main_queue(), ^{ completion(NO); });
+             return;
+         }
+-
+-        NSMutableURLRequest *jsonRequest = [NSMutableURLRequest requestWithURL:jsonURL];
+-        jsonRequest.timeoutInterval = 30.0;
+-        jsonRequest.cachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
+-        [jsonRequest setValue:@"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15" forHTTPHeaderField:@"User-Agent"];
+-
+-        // 使用 NSURLSession dataTaskWithCompletionHandler 替代已废弃的 NSURLConnection sendSynchronousRequest
+-        // 已在外层 dispatch_async 到后台队列，此处用信号量等待结果
+-        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+-        __block NSData *jsonData = nil;
+-        NSURLSessionDataTask *jsonTask = [[NSURLSession sharedSession] dataTaskWithRequest:jsonRequest
+-                                                                          completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+-            jsonData = data;
+-            dispatch_semaphore_signal(sem);
+-        }];
+-        [jsonTask resume];
+-        // 等待最多 30 秒（与 timeoutInterval 一致）
+-        dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30 * NSEC_PER_SEC)));
+-
++        NSString *jsonReason = nil;
++        NSData *jsonData = AMEFetchVersionJSON(jsonURL, &jsonReason);
+         if (!jsonData) {
+-            NSLog(@"[DownloadVC] Failed to download version JSON for %@", versionId);
+-            if (completion) dispatch_async(dispatch_get_main_queue(), ^{ completion(NO); });
++            NSLog(@"[DownloadVC] Failed to download version JSON for %@: %@", versionId, jsonReason);
++            dispatch_async(dispatch_get_main_queue(), ^{
++                __strong typeof(weakSelf) ss = weakSelf;
++                if (ss) ss.lastVersionFetchError = jsonReason;
++                if (completion) completion(NO);
++            });
+             return;
+         }
+ 
