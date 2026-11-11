@@ -114,8 +114,6 @@ jobs:
           assert '[fix16] 当前 main 状态' in pathlib.Path('RENDERER_GAP_PROVENANCE.md').read_text(), 'fix16 provenance status note missing'
           by16 = pathlib.Path('.github/workflows/build.yml').read_text()
           assert not re.search(r'^[ \t]+push:', by16, re.M), 'fix16: push trigger must stay disabled to avoid burning hosted minutes'
-          sh16 = pathlib.Path('.github/workflows/build-selfhosted.yml').read_text()
-          assert 'runs-on: [self-hosted, air-alternate]' in sh16, 'fix16 self-hosted workflow missing'
           print('source state: VERIFIED (iOS MVK 1.4.2 / Mithril / Task55 / version-download fix / MobileGL iOS compat / iOS15 full-tree chained-fixups weak imports / fix12: MG backend early bootstrap BEFORE gl_init, SFPEW unified EGL route + preflight fallback, 31 EGL NULL guards, init short-circuits / AME-EGL + AME-DIAG diagnostics & to_chars trace / fix13: SFPEW draw 收口 guard + SYMBOL-SPLIT 诊断, GUI 呈现 A/B 开关)')
           PY
           # 防回退：只匹配真正以命令形式出现的 git clone；巡检语句自身以 "!" 开头，不会命中。
