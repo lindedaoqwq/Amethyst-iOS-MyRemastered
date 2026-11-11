@@ -12,10 +12,6 @@ on:
 permissions:
   contents: write
 
-concurrency:
-  group: air-alternate-build
-  cancel-in-progress: true
-
 env:
   # 本仓库已自包含完整源码（含 submodule 内容、iOS MoltenVK 1.4.2 二进制）。
   # 上游 LFS fixture 以普通文本固化且不参与构建；保留开关避免 smudge 干扰。
