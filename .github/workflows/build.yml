@@ -1,6 +1,6 @@
 name: Build Air Alternate
 
-# [fix16] 自动触发已移除：托管 macos-15 runner 按 10x 倍率计入 Actions 额度，
+# [fix16] 自动触发已移除：托管 macOS runner 按 10x 倍率计入 Actions 额度，
 # 额度耗尽后任何推送都会产生一个立即挂起/失败的付费 job。现统一改为手动触发：
 #   - 自有 Mac（零额度消耗）：触发 build-selfhosted.yml，走 self-hosted runner
 #   - GitHub 托管（额度恢复后）：触发本 workflow 的 workflow_dispatch
@@ -24,7 +24,7 @@ env:
 jobs:
   build:
     name: Build Air Alternate IPA (iOS arm64)
-    runs-on: macos-15
+    runs-on: macos-14
     timeout-minutes: 300
     steps:
       - name: Checkout source (self-contained, no upstream clone)
