@@ -1,6 +1,19 @@
 # Air Alternate 6.0.0 —— 不用自有 Mac、不用 GitHub Actions 的构建配置
 #
-# 平台：Codemagic 免费层（Mac mini M2，500 macOS 分钟/月，无需信用卡）
+# 平台：Codemagic Free（个人单用户层，Base cost $0/月，500 macOS M2 分钟/月，每月重置）
+# 官方定价页 "For individuals" 段：Single-user plan with unlimited number of
+# applications and 500 free build minutes refilled every month.
+#
+# 费用安全（重要，避免被误认为要付费）：
+#   - 注册与构建都不需要信用卡；定价页上醒目的 $0.095/min 和 $3,990/年 属于
+#     Pay-as-you-go 与 Fixed price 套餐，不是 Free 层。
+#   - 计费只对「主动启用 billing」的账号生效。官方计费文档原文：
+#     "In order to use the paid features of Codemagic, you must enable billing."
+#     启用时才要求输入信用卡。全程不要点 Billing -> Enable billing、不要绑卡。
+#   - 免费分钟用完后构建会停下来，不会静默自动扣费；继续构建需手动启用订阅。
+#     注册后先到 Billing 页确认仍处于「未启用」状态再开始。
+#   - 本配置不写 triggering，只能手动 Start new build，不会因 push 自动烧分钟。
+#
 # 仓库：public fork lindedaoqwq/Amethyst-iOS-MyRemastered（源码自包含，无需私有凭据）
 #
 # 用法（仅需一次）：
